@@ -10,6 +10,13 @@ restarts dead workers, and so on.
 
 Only one listening socket is set up, then libevent (via gevent) is used to
 asynchronously accept connections, read the data and write the response.
+
+Dependencies
+============
+
+ * Python 2.6 (I'd guess)
+ * gevent
+ * python-daemon
 """
 
 import os
@@ -19,11 +26,14 @@ import socket
 import signal
 import optparse
 from contextlib import closing
+from functools import partial
 
 import gevent
 from gevent import core
 from gevent.http import HTTPServer
-from gevent.wsgi import WSGIServer
+from gevent.wsgi import WSGIServer, WSGIHandler
+from daemon import DaemonContext
+from daemon.pidlockfile import PIDLockFile
 
 try:
     from procname import setprocname
@@ -113,10 +123,11 @@ if not _django_loaded:
 parser = optparse.OptionParser()
 A = parser.add_option
 A("-f", "--factory", dest="factory", default="wsgi", metavar="NAME",
-  help="Use NAME to spawn WSGI application. (default: wsgi) "
-       "Note that this option needs to be the first argument if set.")
+  help="Use NAME to spawn WSGI application. (default: wsgi)\n"
+       "Note that this option needs to be the first argument if set.\n"
+       "Using ? as NAME lists available factories.")
 A("-i", "--host", dest="addr", default="127.0.0.1", metavar="ADDR",
-  help="IP address (interface) to bind to (default: any)")
+  help="IP address (interface) to bind to (default: 127.0.0.1)")
 A("-p", "--port", dest="port", default=8000, type=int, metavar="PORT",
   help="TCP port to bind to (default: 8000)")
 
@@ -138,13 +149,15 @@ A("--access-log", dest="access_log", default="-", metavar="FILE",
   help="Write access log to FILE. (default: -, meaning stderr)")
 
 # TODO Implement this option group.
-G = optparse.OptionGroup(parser, "Daemonizing (require -d/--daemonize)")
+G = optparse.OptionGroup(parser, "Daemonizing")
 A = G.add_option
 parser.add_option_group(G)
-A("-d", "--daemonize", dest="daemonize", action="store_true",
-  help="Set up listeners and then daemonize.")
+A("-d", "--detach", dest="detach", action="store_true",
+  help="Detach from controlling terminal.")
 A("--pidfile", dest="pidfile", metavar="FILE",
-  help="Write master process ID to FILE.")
+  help="Write master PID to FILE.")
+A("--chroot", dest="chroot_dir", metavar="DIR",
+  help="Change root directory to DIR (chroot).")
 A("--user", dest="set_user", metavar="USER", help="Change to USER.")
 A("--group", dest="set_group", metavar="GROUP", help="Change to GROUP.")
 # }}}
@@ -152,17 +165,30 @@ A("--group", dest="set_group", metavar="GROUP", help="Change to GROUP.")
 signal_reload = signal.SIGHUP
 signal_stop = signal.SIGUSR1
 
+class AccessLogWSGIHandler(WSGIHandler):
+    def __init__(self, *args, **kwds):
+        self.access_log = kwds.pop("access_log", None)
+        super(AccessLogWSGIHandler, self).__init__(*args, **kwds)
+
+    def log_request(self, *args):
+        out = getattr(self, "access_log", None)
+        print >>out, self.format_request(*args)
+
 class Worker(WSGIServer):
     """Plain WSGI server with misc. worker-related additions."""
 
+    handler_class = AccessLogWSGIHandler
     base_env = WSGIServer.base_env.copy()
     base_env["wsgi.multiprocess"] = True
 
-    def __init__(self, sock, application, backlog=24, *args, **kwds):
+    def __init__(self, sock, application, backlog=24, access_log=None,
+                 *args, **kwds):
         address = sock.getsockname()
         super(Worker, self).__init__(address, application, *args, **kwds)
         self.sock = sock
         self.backlog = backlog
+        self.access_log = access_log
+        self.handler_class = partial(self.handler_class, access_log=access_log)
 
     def _cb_stop_worker(self):
         self.log_server("Stop signal")
@@ -197,7 +223,7 @@ class Worker(WSGIServer):
         return str(os.getpid())
 
     def log_server(self, msg):
-        print "%8s %s" % (self.ident, msg)
+        print >>sys.stderr, "%8s %s" % (self.ident, msg)
 
 class WorkerController(object):
     """Master's channel to a worker pipe (and PID)."""
@@ -308,13 +334,10 @@ class Master(object):
         self.log_server("Stop event")
 
     def start(self):
-        """Set up signal hooks and write pidfile."""
+        """Set up signal actions."""
         setprocname("gevent-spawn.py: master")
         core.signal(signal.SIGCHLD, self._cb_sigchld)
         core.signal(signal.SIGHUP, self._cb_sighup)
-        if self.pidfile:
-            with closing(open(self.pidfile, "w")) as fp:
-                fp.write("%d\n" % os.getpid())
 
     def start_worker(self, sock=None):
         """Start a worker on *sock* or *self.sock* and add to list."""
@@ -420,7 +443,7 @@ class Master(object):
             return "master"
 
     def log_server(self, msg):
-        print "%8s %s" % (self.ident, msg)
+        print >>sys.stderr, "%8s %s" % (self.ident, msg)
 
 def main(argv, exec_argv):
     # This fine hack to be able to inject optparse options before parsing.
@@ -447,13 +470,39 @@ def main(argv, exec_argv):
         parser.error("insufficient arguments for factory")
     wsgi_app = factory.make_wsgi_app(opts, *args)
     master = Master((opts.addr, opts.port), wsgi_app)
-    master.configure_workers(backlog=opts.backlog)
-    master.spawn_workers(opts.num_procs)
-    master.pidfile = opts.pidfile
-    try:
-        master.serve_forever()
-    except KeyboardInterrupt:
-        master.stop()
+    # Set up daemon context
+    status_log = sys.stderr
+    if opts.error_log != "-":
+        status_log = open(opts.error_log, "a+")
+    access_log = sys.stdout
+    if opts.access_log != "-":
+        access_log = open(opts.access_log, "a+")
+    master.configure_workers(backlog=opts.backlog, access_log=access_log)
+    dctx = DaemonContext(stdout=status_log, stderr=status_log)
+    dctx.files_preserve = [master.sock, access_log]
+    dctx.detach_process = opts.detach
+    dctx.chroot_directory = opts.chroot_dir
+    # Better to explicitly state that no signal mapping should be done; we do
+    # this with libevent and I'd think these interfere with eachother.
+    # TODO Subclass DaemonContext and make the signal map use gevent?
+    dctx.signal_map = {}
+    if opts.pidfile:
+        dctx.pidfile = PIDLockFile(opts.pidfile, threaded=False)
+        print "pidfile =", dctx.pidfile
+    if opts.set_user:
+        from pwd import getpwnam
+        dctx.uid = getpwnam(user).pw_uid
+    if opts.set_group:
+        from grp import getgrnam
+        dctx.gid = getgrnam(group).gr_gid
+    # Go!
+    with dctx:
+        gevent.reinit()  # Needs to be done as dctx might've forked.
+        master.spawn_workers(opts.num_procs)
+        try:
+            master.serve_forever()
+        except KeyboardInterrupt:
+            master.stop()
 
 if __name__ == "__main__":
     import sys

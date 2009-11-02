@@ -488,10 +488,10 @@ def main(argv, exec_argv):
         print "pidfile =", dctx.pidfile
     if opts.set_user:
         from pwd import getpwnam
-        dctx.uid = getpwnam(user).pw_uid
+        dctx.uid = getpwnam(opts.set_user).pw_uid
     if opts.set_group:
         from grp import getgrnam
-        dctx.gid = getgrnam(group).gr_gid
+        dctx.gid = getgrnam(opts.set_group).gr_gid
     # Go!
     with dctx:
         gevent.reinit()  # Needs to be done as dctx might've forked.

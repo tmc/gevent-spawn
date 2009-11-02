@@ -23,7 +23,7 @@ import os
 import time
 import socket
 import signal
-import optparse
+from optparse import make_option, OptionParser, OptionGroup
 from functools import partial
 
 import gevent
@@ -43,7 +43,6 @@ signame_map = dict((v, a) for (a, v) in vars(signal).items()
                    if a.startswith("SIG"))
 signame_lookup = lambda s: signame_map.get(s, str(s))
 
-O = optparse.make_option
 
 # {{{ Factories
 class BaseFactory(object):
@@ -95,10 +94,10 @@ class DjangoFactory(BaseFactory):
     args_desc = "<settings module qualifier>"
 
     wsgi_app = "django.core.handlers.wsgi:WSGIHandler()"
-    opts = [O("--force-settings", dest="force_settings", action="store_true",
-              help="Force settings to be configured."),
-            O("--wsgi-app", dest="wsgi_app", metavar="APP", default=wsgi_app,
-              help="Use WSGI application to run Django.")]
+    opts = [make_option("--force-settings", dest="force_settings", action="store_true",
+                        help="Force settings to be configured."),
+            make_option("--wsgi-app", dest="wsgi_app", metavar="APP", default=wsgi_app,
+                        help="Use WSGI application to run Django.")]
 
     @classmethod
     def make_wsgi_app(cls, opts, spec):
@@ -117,46 +116,42 @@ if not _django_loaded:
 # }}}
 
 # {{{ Options
-parser = optparse.OptionParser()
-A = parser.add_option
-A("-f", "--factory", dest="factory", default="wsgi", metavar="NAME",
-  help="Use NAME to spawn WSGI application. (default: wsgi)\n"
-       "Note that this option needs to be the first argument if set.\n"
-       "Using ? as NAME lists available factories.")
-A("-i", "--host", dest="addr", default="127.0.0.1", metavar="ADDR",
-  help="IP address (interface) to bind to (default: 127.0.0.1)")
-A("-p", "--port", dest="port", default=8000, type=int, metavar="PORT",
-  help="TCP port to bind to (default: 8000)")
+parser = OptionParser()
+parser.add_option("-f", "--factory", default="wsgi", metavar="NAME",
+                  help="Use NAME to spawn WSGI application. (default: wsgi)\n"
+                       "Note that this option needs to be the first argument if set.\n"
+                       "Using ? as NAME lists available factories.")
+parser.add_option("-i", "--host", default="127.0.0.1", metavar="ADDR",
+                  help="IP address (interface) to bind to (default: 127.0.0.1)")
+parser.add_option("-p", "--port", dest="port", default=8000, type=int, metavar="PORT",
+                  help="TCP port to bind to (default: 8000)")
 
-G = optparse.OptionGroup(parser, "Performance and concurrency")
-A = G.add_option
-parser.add_option_group(G)
-A("--backlog", dest="backlog", type=int, default=5, metavar="NUM",
-  help="Set kernel listen queue to size NUM.")
-A("-w", "--workers", "--processes", dest="num_procs", type=int, default=1,
-  metavar="NUM", help="Fork to NUM processes accepting on the same socket.")
+group = OptionGroup(parser, "Performance and concurrency")
+parser.add_option_group(group)
+group.add_option("--backlog", type=int, default=5, metavar="NUM",
+                 help="Set kernel listen queue to size NUM.")
+group.add_option("-w", "--workers", "--processes", type=int, default=1,
+                 metavar="NUM", help="Fork to NUM processes accepting on the same socket.")
 
 # TODO Implement this option group.
-G = optparse.OptionGroup(parser, "Logging")
-A = G.add_option
-parser.add_option_group(G)
-A("--error-log", dest="error_log", default="-", metavar="FILE",
-  help="Write error (status) log to FILE. (default: -, meaning stderr)")
-A("--access-log", dest="access_log", default="-", metavar="FILE",
-  help="Write access log to FILE. (default: -, meaning stderr)")
+group = OptionGroup(parser, "Logging")
+parser.add_option_group(group)
+group.add_option("--error-log", default="-", metavar="FILE",
+                 help="Write error (status) log to FILE. (default: -, meaning stderr)")
+group.add_option("--access-log", default="-", metavar="FILE",
+                 help="Write access log to FILE. (default: -, meaning stderr)")
 
 # TODO Implement this option group.
-G = optparse.OptionGroup(parser, "Daemonizing")
-A = G.add_option
-parser.add_option_group(G)
-A("-d", "--detach", dest="detach", action="store_true",
-  help="Detach from controlling terminal.")
-A("--pidfile", dest="pidfile", metavar="FILE",
-  help="Write master PID to FILE.")
-A("--chroot", dest="chroot_dir", metavar="DIR",
-  help="Change root directory to DIR (chroot).")
-A("--user", dest="set_user", metavar="USER", help="Change to USER.")
-A("--group", dest="set_group", metavar="GROUP", help="Change to GROUP.")
+group = OptionGroup(parser, "Daemonizing")
+parser.add_option_group(group)
+group.add_option("-d", "--detach", action="store_true",
+                 help="Detach from controlling terminal.")
+group.add_option("--pidfile", metavar="FILE",
+                 help="Write master PID to FILE.")
+group.add_option("--chroot", metavar="DIR",
+                 help="Change root directory to DIR (chroot).")
+group.add_option("--user", metavar="USER", help="Change to USER.")
+group.add_option("--group", metavar="GROUP", help="Change to GROUP.")
 # }}}
 
 signal_reload = signal.SIGHUP
@@ -466,7 +461,7 @@ def main(argv, exec_argv):
     if not factory.args_sufficient(opts, args):
         parser.error("insufficient arguments for factory")
     wsgi_app = factory.make_wsgi_app(opts, *args)
-    master = Master((opts.addr, opts.port), wsgi_app)
+    master = Master((opts.host, opts.port), wsgi_app)
     # Set up daemon context
     status_log = sys.stderr
     if opts.error_log != "-":
@@ -478,7 +473,7 @@ def main(argv, exec_argv):
     dctx = DaemonContext(stdout=status_log, stderr=status_log)
     dctx.files_preserve = [master.sock, access_log]
     dctx.detach_process = opts.detach
-    dctx.chroot_directory = opts.chroot_dir
+    dctx.chroot_directory = opts.chroot
     # Better to explicitly state that no signal mapping should be done; we do
     # this with libevent and I'd think these interfere with eachother.
     # TODO Subclass DaemonContext and make the signal map use gevent?
@@ -486,16 +481,16 @@ def main(argv, exec_argv):
     if opts.pidfile:
         dctx.pidfile = PIDLockFile(opts.pidfile, threaded=False)
         print "pidfile =", dctx.pidfile
-    if opts.set_user:
+    if opts.user:
         from pwd import getpwnam
-        dctx.uid = getpwnam(opts.set_user).pw_uid
-    if opts.set_group:
+        dctx.uid = getpwnam(opts.user).pw_uid
+    if opts.group:
         from grp import getgrnam
-        dctx.gid = getgrnam(opts.set_group).gr_gid
+        dctx.gid = getgrnam(opts.group).gr_gid
     # Go!
     with dctx:
         gevent.reinit()  # Needs to be done as dctx might've forked.
-        master.spawn_workers(opts.num_procs)
+        master.spawn_workers(opts.workers)
         try:
             master.serve_forever()
         except KeyboardInterrupt:

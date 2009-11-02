@@ -19,7 +19,32 @@ Dependencies
  * python-daemon
 """
 
+DJANGO_HANDLER = 'django.core.handlers.wsgi:WSGIHandler()'
+
+__usage__ = """%%prog [options] <wsgi app>
+
+The program accepts at most one argument, a wsgi app to run.
+It should be of form MODULE[:ATTR[()]], where
+ - MODULE is a Python module or a path to a Python script.
+ - ATTR is an attribute of the module that is used as an application.
+   If ATTR is followed by '()', it's instantiated first, and then
+   the result of the instantiation is used.
+
+Examples:
+
+   # wsgiapp.py defines 'application' that is used
+   %%prog examples/wsgiapp.py
+
+   %%prog myproject.mypackage.myapp:WSGIApp()
+
+   # <wsgi app> defaults to %s
+   # when --django-settings option is provided or DJANGO_SETTINGS_MODULE environment variable is set.
+   %%prog --django-settings mysite.myapp.settings
+   DJANGO_SETTINGS_MODULE=mysite.myapp.settings %%prog
+""" % DJANGO_HANDLER
+
 import os
+import imp
 import time
 import socket
 import signal
@@ -45,20 +70,11 @@ signame_map = dict((v, a) for (a, v) in vars(signal).items()
 signame_lookup = lambda s: signame_map.get(s, str(s))
 
 
-# {{{ Factories
-class BaseFactory(object):
-
-    @classmethod
-    def args_sufficient(cls, opts, args):
-        if hasattr(cls, "num_args"):
-            return len(args) == cls.num_args
-        return True
-
-    @classmethod
-    def configure_parser(cls, parser):
-        parser.set_usage("%prog [options] " + cls.args_desc)
-        parser.add_options(getattr(cls, "opts", ()))
-
+def import_filename(filename):
+    for suffix, mode, type in imp.get_suffixes():
+        if filename.endswith(suffix):
+            name = filename[:-len(suffix)]
+            return imp.load_module(name, open(filename), filename, (suffix, mode, type))
 
 def load_app_spec(spec):
     if ":" in spec:
@@ -68,67 +84,40 @@ def load_app_spec(spec):
     call = False
     if attname.endswith("()"):
         attname, call = attname[:-2], True
-    mod = __import__(modname, fromlist=[attname])
-    rv = getattr(mod, attname)
+    if os.path.isfile(modname):
+        try:
+            mod = import_filename(modname)
+        except IOError, ex:
+            sys.exit('Cannot load %r: %s.' % (modname, ex))
+    else:
+        if '/' in modname or '\\' in modname:
+            sys.exit('Not a file: %r.' % (modname, ))
+        try:
+            mod = __import__(modname, fromlist=[attname])
+        except ImportError, ex:
+            sys.exit('Cannot load %r: %s.' % (modname, ex))
+    if mod is None:
+        sys.exit('Cannot load %r.' % modname)
+    try:
+        rv = getattr(mod, attname)
+    except AttributeError:
+        sys.exit('Module %r has no attribute %r.' % (modname, attname))
     if call:
         rv = rv()
     return rv
 
 
-class WSGIFactory(BaseFactory):
-    """WSGI application from a path.to.module[:attr] specification."""
-    num_args = 1
-    args_desc = "<app qualifier>"
-
-    @classmethod
-    def make_wsgi_app(cls, opts, spec):
-        return load_app_spec(spec)
-
-try:
-    from django.conf import settings as django_settings, Settings as DjangoSettings
-except ImportError:
-    _django_loaded = False
-else:
-    _django_loaded = True
-
-
-class DjangoFactory(BaseFactory):
-    """Django application from a settings module specification."""
-    num_args = 1
-    args_desc = "<settings module qualifier>"
-
-    wsgi_app = "django.core.handlers.wsgi:WSGIHandler()"
-    opts = [make_option("--force-settings", dest="force_settings", action="store_true",
-                        help="Force settings to be configured."),
-            make_option("--wsgi-app", dest="wsgi_app", metavar="APP", default=wsgi_app,
-                        help="Use WSGI application to run Django.")]
-
-    @classmethod
-    def make_wsgi_app(cls, opts, spec):
-        if opts.force_settings or not django_settings.configured:
-            django_settings._wrapped = DjangoSettings(spec)
-        elif django_settings.configured:
-            if django_settings.SETTINGS_MODULE != spec:
-                raise ValueError("django already configured for %s" %
-                                 django_settings.SETTINGS_MODULE)
-        return load_app_spec(opts.wsgi_app)
-
-factories = {"wsgi": WSGIFactory, "django": DjangoFactory}
-
-if not _django_loaded:
-    factories.pop("django")
-# }}}
-
 # {{{ Options
 parser = OptionParser()
-parser.add_option("-f", "--factory", default="wsgi", metavar="NAME",
-                  help="Use NAME to spawn WSGI application. (default: wsgi)\n"
-                       "Note that this option needs to be the first argument if set.\n"
-                       "Using ? as NAME lists available factories.")
+parser.set_usage(__usage__)
 parser.add_option("-i", "--host", default="127.0.0.1", metavar="ADDR",
                   help="IP address (interface) to bind to (default: 127.0.0.1)")
 parser.add_option("-p", "--port", dest="port", default=8000, type=int, metavar="PORT",
                   help="TCP port to bind to (default: 8000)")
+
+group = OptionGroup(parser, "Django web framework")
+parser.add_option_group(group)
+group.add_option('--django-settings', help="Set DJANGO_SETTINGS_MODULE environment variable")
 
 group = OptionGroup(parser, "Performance and concurrency")
 parser.add_option_group(group)
@@ -448,29 +437,29 @@ class Master(object):
 
 
 def main(argv, exec_argv):
-    # This fine hack to be able to inject optparse options before parsing.
-    if argv and (argv[0] in ("-f", "--factory") or argv[0].startswith("--factory=")):
-        factory_opt = argv.pop(0)
-        if "=" in factory_opt:
-            factory_name = factory_opt.split("=", 1)[1]
-        else:
-            factory_name = argv.pop(0)
-    else:
-        factory_name = "wsgi"
-    if factory_name not in factories:
-        factory_help = "".join(" * %s: %s\n" % (k, f.__doc__.split("\n", 1)[0])
-                               for k, f in factories.iteritems())
-        if factory_name == "?":
-            parser.exit(0, factory_help)
-        else:
-            parser.error("unknown factory\n" + factory_help[:-1])
-    factory = factories[factory_name]
-    factory.configure_parser(parser)
-    # Parse options.
     opts, args = parser.parse_args(args=argv)
-    if not factory.args_sufficient(opts, args):
-        parser.error("insufficient arguments for factory")
-    wsgi_app = factory.make_wsgi_app(opts, *args)
+
+    ENVIRONMENT_VARIABLE = "DJANGO_SETTINGS_MODULE"
+
+    if opts.django_settings is not None:
+        os.environ[ENVIRONMENT_VARIABLE] = opts.django_settings
+
+    if not args and ENVIRONMENT_VARIABLE in os.environ:
+        args = (DJANGO_HANDLER, )
+
+    if not args:
+        sys.exit('''Please specify the application to run: pass WSGI app spec as an argument.
+
+If you're trying to run a Django app, setting DJANGO_SETTINGS_MODULE environment variable
+or passing --django-settings options would also work.
+
+Type %s -h for help.''' % sys.argv[0])
+
+    if len(args)!=1:
+        sys.exit('Too many arguments. Type %s -h for help.' % sys.argv[0])
+
+    wsgi_app = load_app_spec(args[0])
+
     master = Master((opts.host, opts.port), wsgi_app)
     # Set up daemon context
     status_log = sys.stderr

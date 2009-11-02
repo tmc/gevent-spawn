@@ -27,8 +27,8 @@ The program accepts at most one argument, a wsgi app to run.
 It should be of form MODULE[:ATTR[()]], where
  - MODULE is a Python module or a path to a Python script.
  - ATTR is an attribute of the module that is used as an application.
-   If ATTR is followed by '()', it's instantiated first, and then
-   the result of the instantiation is used.
+   If ATTR is followed by '()', that object is called first, and then
+   the return value of the call is used.
 
 Examples:
 

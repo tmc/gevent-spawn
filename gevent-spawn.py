@@ -21,11 +21,9 @@ Dependencies
 
 import os
 import time
-import errno
 import socket
 import signal
 import optparse
-from contextlib import closing
 from functools import partial
 
 import gevent

@@ -36,7 +36,8 @@ from daemon.pidlockfile import PIDLockFile
 try:
     from procname import setprocname
 except ImportError:
-    def setprocname(name): pass
+    def setprocname(name):
+        pass
 
 # An ugly way to do this, but it works well.
 signame_map = dict((v, a) for (a, v) in vars(signal).items()
@@ -46,6 +47,7 @@ signame_lookup = lambda s: signame_map.get(s, str(s))
 
 # {{{ Factories
 class BaseFactory(object):
+
     @classmethod
     def args_sufficient(cls, opts, args):
         if hasattr(cls, "num_args"):
@@ -56,6 +58,7 @@ class BaseFactory(object):
     def configure_parser(cls, parser):
         parser.set_usage("%prog [options] " + cls.args_desc)
         parser.add_options(getattr(cls, "opts", ()))
+
 
 def load_app_spec(spec):
     if ":" in spec:
@@ -71,6 +74,7 @@ def load_app_spec(spec):
         rv = rv()
     return rv
 
+
 class WSGIFactory(BaseFactory):
     """WSGI application from a path.to.module[:attr] specification."""
     num_args = 1
@@ -81,12 +85,12 @@ class WSGIFactory(BaseFactory):
         return load_app_spec(spec)
 
 try:
-    from django.conf import settings as django_settings, \
-                            Settings as DjangoSettings
+    from django.conf import settings as django_settings, Settings as DjangoSettings
 except ImportError:
     _django_loaded = False
 else:
     _django_loaded = True
+
 
 class DjangoFactory(BaseFactory):
     """Django application from a settings module specification."""
@@ -157,7 +161,9 @@ group.add_option("--group", metavar="GROUP", help="Change to GROUP.")
 signal_reload = signal.SIGHUP
 signal_stop = signal.SIGUSR1
 
+
 class AccessLogWSGIHandler(WSGIHandler):
+
     def __init__(self, *args, **kwds):
         self.access_log = kwds.pop("access_log", None)
         super(AccessLogWSGIHandler, self).__init__(*args, **kwds)
@@ -165,6 +171,7 @@ class AccessLogWSGIHandler(WSGIHandler):
     def log_request(self, *args):
         out = getattr(self, "access_log", None)
         print >>out, self.format_request(*args)
+
 
 class Worker(WSGIServer):
     """Plain WSGI server with misc. worker-related additions."""
@@ -217,6 +224,7 @@ class Worker(WSGIServer):
     def log_server(self, msg):
         print >>sys.stderr, "%8s %s" % (self.ident, msg)
 
+
 class WorkerController(object):
     """Master's channel to a worker pipe (and PID)."""
 
@@ -237,7 +245,7 @@ class WorkerController(object):
     def __repr__(self):
         a = self._pid, self.wfile.fileno(), self.rfile.fileno()
         return "<%s of %s (%d, %d)>" % ((self.__class__.__name__,) + a)
-    
+
     def __eq__(self, other):
         if hasattr(other, "pid"):
             other = other.pid
@@ -287,6 +295,7 @@ class WorkerController(object):
             self.in_buff[:] = [notifies.pop()]
             for msg in notifies:
                 gevent.spawn(ev.arg, msg)
+
 
 class Master(object):
     base_env = WSGIServer.base_env.copy()
@@ -437,6 +446,7 @@ class Master(object):
     def log_server(self, msg):
         print >>sys.stderr, "%8s %s" % (self.ident, msg)
 
+
 def main(argv, exec_argv):
     # This fine hack to be able to inject optparse options before parsing.
     if argv and (argv[0] in ("-f", "--factory") or argv[0].startswith("--factory=")):
@@ -495,6 +505,7 @@ def main(argv, exec_argv):
             master.serve_forever()
         except KeyboardInterrupt:
             master.stop()
+
 
 if __name__ == "__main__":
     import sys

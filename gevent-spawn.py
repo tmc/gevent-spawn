@@ -116,7 +116,6 @@ factories = {"wsgi": WSGIFactory, "django": DjangoFactory}
 
 if not _django_loaded:
     factories.pop("django")
-    del configure_django_settings
 # }}}
 
 # {{{ Options

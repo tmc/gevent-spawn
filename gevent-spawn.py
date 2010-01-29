@@ -44,37 +44,14 @@ Examples:
 """ % DJANGO_HANDLER
 
 import os
-import imp
-import time
-import socket
-import signal
-from optparse import make_option, OptionParser, OptionGroup
-from functools import partial
+from optparse import OptionParser, OptionGroup
 
 import gevent
-from gevent import core
-from gevent.http import HTTPServer
-from gevent.wsgi import WSGIServer, WSGIHandler
 from daemon import DaemonContext
 from daemon.pidlockfile import PIDLockFile
 
-try:
-    from procname import setprocname
-except ImportError:
-    def setprocname(name):
-        pass
-
-# An ugly way to do this, but it works well.
-signame_map = dict((v, a) for (a, v) in vars(signal).items()
-                   if a.startswith("SIG"))
-signame_lookup = lambda s: signame_map.get(s, str(s))
-
-
-def import_filename(filename):
-    for suffix, mode, type in imp.get_suffixes():
-        if filename.endswith(suffix):
-            name = filename[:-len(suffix)]
-            return imp.load_module(name, open(filename), filename, (suffix, mode, type))
+from gevent_spawn.utils import import_filename
+from gevent_spawn.master import Master
 
 def load_app_spec(spec):
     if ":" in spec:
@@ -106,7 +83,6 @@ def load_app_spec(spec):
         rv = rv()
     return rv
 
-
 # {{{ Options
 parser = OptionParser()
 parser.set_usage(__usage__)
@@ -134,7 +110,6 @@ group.add_option("--error-log", default="-", metavar="FILE",
 group.add_option("--access-log", default="-", metavar="FILE",
                  help="Write access log to FILE. (default: -, meaning stderr)")
 
-# TODO Implement this option group.
 group = OptionGroup(parser, "Daemonizing")
 parser.add_option_group(group)
 group.add_option("-d", "--detach", action="store_true",
@@ -146,295 +121,6 @@ group.add_option("--chroot", metavar="DIR",
 group.add_option("--user", metavar="USER", help="Change to USER.")
 group.add_option("--group", metavar="GROUP", help="Change to GROUP.")
 # }}}
-
-signal_reload = signal.SIGHUP
-signal_stop = signal.SIGUSR1
-
-
-class AccessLogWSGIHandler(WSGIHandler):
-
-    def __init__(self, *args, **kwds):
-        self.access_log = kwds.pop("access_log", None)
-        super(AccessLogWSGIHandler, self).__init__(*args, **kwds)
-
-    def log_request(self, *args):
-        out = getattr(self, "access_log", None)
-        print >>out, self.format_request(*args)
-
-
-class Worker(WSGIServer):
-    """Plain WSGI server with misc. worker-related additions."""
-
-    handler_class = AccessLogWSGIHandler
-    base_env = WSGIServer.base_env.copy()
-    base_env["wsgi.multiprocess"] = True
-
-    def __init__(self, sock, application, backlog=24, access_log=None,
-                 *args, **kwds):
-        address = sock.getsockname()
-        super(Worker, self).__init__(address, application, *args, **kwds)
-        self.sock = sock
-        self.backlog = backlog
-        self.access_log = access_log
-        self.handler_class = partial(self.handler_class, access_log=access_log)
-
-    def _cb_stop_worker(self):
-        self.log_server("Stop signal")
-        self._stopped_event.set()
-
-    def start(self):
-        setprocname("gevent-spawn.py: worker")
-        HTTPServer.start(self, self.sock)
-        core.signal(signal_stop, self._cb_stop_worker)
-        env = self.base_env.copy()
-        env["SERVER_NAME"] = socket.getfqdn(self.server_host)
-        env["SERVER_PORT"] = str(self.server_port)
-        self.base_env = env
-        self.log_server("Worker serving on %s:%d" %
-                        (self.server_host, self.server_port))
-        return self.sock
-
-    def handle_notification(self, msg):
-        if not msg:
-            self.log_server("Master seems to have died, harakiri")
-            self._stopped_event.set()
-        elif msg == "stop":
-            self.log_server("Master says stop")
-            self._stopped_event.set()
-        elif msg == "hello":
-            self.log_server("Master says hi")  # DEBUG
-        else:
-            self.log_server("Unknown notify: " + repr(msg))
-
-    @property
-    def ident(self):
-        return str(os.getpid())
-
-    def log_server(self, msg):
-        print >>sys.stderr, "%8s %s" % (self.ident, msg)
-
-
-class WorkerController(object):
-    """Master's channel to a worker pipe (and PID)."""
-
-    def __init__(self, pid, pipe_r=None, pipe_w=None):
-        self._pid = pid
-        if pipe_r and not hasattr(pipe_r, "fileno"):
-            pipe_r = os.fdopen(pipe_r, "r")
-        if pipe_w and not hasattr(pipe_w, "fileno"):
-            pipe_w = os.fdopen(pipe_w, "w")
-        self.rfile = pipe_r
-        self.wfile = pipe_w
-        self.in_buff = []
-        self.out_buff = []
-
-    def __str__(self):
-        return "Worker PID #%d" % self._pid
-
-    def __repr__(self):
-        a = self._pid, self.wfile.fileno(), self.rfile.fileno()
-        return "<%s of %s (%d, %d)>" % ((self.__class__.__name__,) + a)
-
-    def __eq__(self, other):
-        if hasattr(other, "pid"):
-            other = other.pid
-        return self._pid == other
-
-    def __cmp__(self, other):
-        if hasattr(other, "pid"):
-            other = other.pid
-        return cmp(self._pid, other)
-
-    def __hash__(self):
-        return hash(self._pid)
-
-    @property
-    def pid(self):
-        return self._pid
-
-    def notify(self, msg):
-        self.out_buff.append(msg + "\n")
-        core.write_event(self.wfile.fileno(), self._cb_notify_write)
-
-    def _cb_notify_write(self, ev, evtype):
-        if not any(self.out_buff):
-            self.out_buff[:] = []
-            ev.cancel()
-        else:
-            data = "".join(self.out_buff)
-            wrote = os.write(ev.fd, data)
-            data = data[wrote:]
-            self.out_buff[:] = [data]
-
-    def begin_notify_receive(self, callback):
-        e = core.event(core.EV_READ | core.EV_PERSIST,
-                       self.rfile.fileno(), self._cb_notify_read,
-                       arg=callback)
-        e.add()
-
-    def _cb_notify_read(self, ev, evtype):
-        chunk = os.read(self.rfile.fileno(), 4096)
-        if not chunk:
-            gevent.spawn(ev.arg, chunk)
-            ev.cancel()
-            return
-        self.in_buff.append(chunk)
-        if "\n" in chunk:
-            notifies = "".join(self.in_buff).split("\n")
-            self.in_buff[:] = [notifies.pop()]
-            for msg in notifies:
-                gevent.spawn(ev.arg, msg)
-
-
-class Master(object):
-    base_env = WSGIServer.base_env.copy()
-    exiting = False
-    pidfile = None
-
-    exit_stopped = 0x10
-
-    def __init__(self, address, wsgi_app):
-        # Convenient way of creating a socket. \o/
-        self.sock = WSGIServer(address, wsgi_app).make_listener(address)
-        self.address = address
-        self.application = wsgi_app
-        self.num_workers = 0
-        self.workers = set()
-        self.worker_args = (), {}
-        self.last_spawn = None
-        self.exit_completed = gevent.event.Event()
-        self.stop_event = gevent.event.Event()
-
-    def configure_workers(self, *args, **kwds):
-        """Set the initialization arguments for the Worker class."""
-        self.worker_args = args, kwds
-
-    def spawn_workers(self, num_workers=1):
-        """Spawn *num_workers* workers."""
-        if not num_workers:
-            raise ValueError("must have at least one process")
-        self.num_workers += num_workers
-        for i in xrange(num_workers):
-            self.start_worker()
-
-    def serve_forever(self):
-        self.start()
-        self.log_server("Master of disaster")
-        self.stop_event.wait()
-        self.log_server("Stop event")
-
-    def start(self):
-        """Set up signal actions."""
-        setprocname("gevent-spawn.py: master")
-        core.signal(signal.SIGCHLD, self._cb_sigchld)
-        core.signal(signal.SIGHUP, self._cb_sighup)
-
-    def start_worker(self, sock=None):
-        """Start a worker on *sock* or *self.sock* and add to list."""
-        if self.stop_event.is_set():
-            raise RuntimeError("start_worker during stop_event")
-        sock = sock if sock else self.sock
-        pipe_r, pipe_w = os.pipe()
-        pid = gevent.fork()
-        if pid:
-            os.close(pipe_r)
-            cntr = WorkerController(pid, pipe_w=pipe_w)
-            self.workers.add(cntr)
-            self.exit_completed.clear()
-            cntr.notify("hello")
-            return pid
-        os.close(pipe_w)
-        w_args, w_kwds = self.worker_args
-        worker = Worker(self.sock, self.application, *w_args, **w_kwds)
-        cntr = WorkerController(os.getpid(), pipe_r=pipe_r)
-        cntr.begin_notify_receive(worker.handle_notification)
-        try:
-            worker.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        os._exit(self.exit_stopped)
-
-    def _cb_sigchld(self):
-        """Handle child status update signal ("update" being "death")."""
-        while self.workers:
-            pid, status = os.waitpid(-1, os.WNOHANG | os.WUNTRACED)
-            if not pid:
-                break
-            elif pid not in self.workers:
-                self.log_server("Oops! Reaped PID %d, which wasn't "
-                                "a known child of ours" % pid)
-                continue
-            self.workers.remove(pid)
-            gevent.spawn(self.handle_worker_status, pid, status)
-
-    def _cb_sighup(self):
-        """Stop all children and thus spawn new."""
-        self.log_server("SIGHUP, stopping children")
-        gevent.spawn(self.notify_workers, "stop")
-
-    def handle_worker_status(self, pid, status):
-        """Respawn worker in place of *pid* and update the list of workers."""
-        pdesc = "PID %d" % pid
-        if os.WIFCONTINUED(status):
-            # Because these are unreliable (only even get them on Linux), and
-            # we don't really need them in any way, ignore them.
-            return
-        elif os.WIFSTOPPED(status):
-            signame = signame_lookup(os.WSTOPSIG(status))
-            self.log_server("%s stopped by signal %s" % (pdesc, signame))
-        elif os.WIFSIGNALED(status):
-            signame = signame_lookup(os.WTERMSIG(status))
-            self.log_server("%s terminated by signal %s" % (pdesc, signame))
-        elif os.WIFEXITED(status):
-            rc = os.WEXITSTATUS(status)
-            if rc == self.exit_stopped:
-                self.log_server("%s exited (stopped)" % pdesc)
-            else:
-                self.log_server("%s exited with exit status %d" % (pdesc, rc))
-        if self.stop_event.is_set():
-            if not self.workers:
-                self.exit_completed.set()
-            return
-        # Compensate for our lost child by making a new worker child.
-        while self.last_spawn == int(time.time()):
-            self.log_server("Sleeping due to high spawn rate")
-            gevent.sleep(1)
-        self.last_spawn = int(time.time())
-        gevent.spawn(self.start_worker)
-
-    def stop(self, timeout=1):
-        """Issue a stop event, and wait for the stop to complete."""
-        self.log_server("Stopping")
-        self.stop_event.set()
-        self.exiting = True
-        gevent.spawn(self.notify_workers, "stop")
-        gevent.spawn_later(1, self.kill_workers)
-        self.exit_completed.wait(timeout=timeout)
-        if not self.exit_completed:
-            wpdesc = ", ".join(map(str, self.workers))
-            self.log_server("Forcefully killing workers: " + wpdesc)
-            self.kill_workers(signal.SIGTERM)
-
-    def notify_workers(self, *args):
-        """Send a notification to all workers."""
-        for worker in self.workers:
-            worker.notify(*args)
-
-    def kill_workers(self, signum=signal_stop):
-        """Send a signal to all workers."""
-        for worker in self.workers:
-            os.kill(worker.pid, signum)
-
-    @property
-    def ident(self):
-        if self.num_workers > 1:
-            return "%d-master" % os.getpid()
-        else:
-            return "master"
-
-    def log_server(self, msg):
-        print >>sys.stderr, "%8s %s" % (self.ident, msg)
-
 
 def main(argv, exec_argv):
     opts, args = parser.parse_args(args=argv)

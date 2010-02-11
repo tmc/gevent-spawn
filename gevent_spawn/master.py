@@ -59,7 +59,7 @@ class Master(object):
     def start_worker(self, sock=None):
         """Start a worker on *sock* or *self.sock* and add to list."""
         if self.stop_event.is_set():
-            raise RuntimeError("start_worker during stop_event")
+            return
         sock = sock if sock else self.sock
         pipe_r, pipe_w = os.pipe()
         pid = gevent.fork()
@@ -123,6 +123,8 @@ class Master(object):
                 self.log_server("%s exited (stopped)" % pdesc)
             else:
                 self.log_server("%s exited with exit status %d" % (pdesc, rc))
+        # If the stop event is set, we mark that the exit is completed when we
+        # notice that we have no more children to wait for.
         if self.stop_event.is_set():
             if not self.workers:
                 self.exit_completed.set()
@@ -142,7 +144,7 @@ class Master(object):
         gevent.spawn(self.notify_workers, "stop")
         gevent.spawn_later(1, self.kill_workers)
         self.exit_completed.wait(timeout=timeout)
-        if not self.exit_completed:
+        if not self.exit_completed.is_set():
             wpdesc = ", ".join(map(str, self.workers))
             self.log_server("Forcefully killing workers: " + wpdesc)
             self.kill_workers(signal.SIGTERM)

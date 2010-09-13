@@ -155,10 +155,11 @@ Type %s -h for help.''' % sys.argv[0])
     if opts.access_log != "-":
         access_log = open(opts.access_log, "a+")
     master.configure_workers(backlog=opts.backlog, access_log=access_log)
-    dctx = DaemonContext(stdout=status_log, stderr=status_log)
+    dctx = DaemonContext(stdout=status_log, stderr=status_log, stdin=sys.stdin if not opts.detach else None)
     dctx.files_preserve = [master.sock, access_log]
     dctx.detach_process = opts.detach
     dctx.chroot_directory = opts.chroot
+    dctx.working_directory = os.getcwd()
     # Better to explicitly state that no signal mapping should be done; we do
     # this with libevent and I'd think these interfere with eachother.
     # TODO Subclass DaemonContext and make the signal map use gevent?

@@ -5,7 +5,6 @@ from functools import partial
 
 from gevent import core
 from gevent.wsgi import WSGIServer, WSGIHandler
-from gevent.http import HTTPServer
 
 from gevent_spawn import signal_stop
 from gevent_spawn.utils import setproctitle
@@ -31,7 +30,7 @@ class Worker(WSGIServer):
                  *args, **kwds):
         address = sock.getsockname()
         super(Worker, self).__init__(address, application, *args, **kwds)
-        self.sock = sock
+        self.socket = sock
         self.backlog = backlog
         self.access_log = access_log
         self.handler_class = partial(self.handler_class, access_log=access_log)
@@ -42,7 +41,8 @@ class Worker(WSGIServer):
 
     def start(self):
         setproctitle("gevent-spawn.py: worker")
-        HTTPServer.start(self, self.sock)
+
+        super(Worker, self).start()
         core.signal(signal_stop, self._cb_stop_worker)
         env = self.base_env.copy()
         env["SERVER_NAME"] = socket.getfqdn(self.server_host)
@@ -50,7 +50,7 @@ class Worker(WSGIServer):
         self.base_env = env
         self.log_server("Worker serving on %s:%d" %
                         (self.server_host, self.server_port))
-        return self.sock
+        return self.socket
 
     def handle_notification(self, msg):
         if not msg:

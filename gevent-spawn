@@ -48,7 +48,7 @@ from optparse import OptionParser, OptionGroup
 
 import gevent
 from daemon import DaemonContext
-from daemon.pidlockfile import PIDLockFile
+from daemon.pidfile import TimeoutPIDLockFile
 
 from gevent_spawn.utils import import_filename
 from gevent_spawn.master import Master
@@ -164,7 +164,7 @@ Type %s -h for help.''' % sys.argv[0])
     # TODO Subclass DaemonContext and make the signal map use gevent?
     dctx.signal_map = {}
     if opts.pidfile:
-        dctx.pidfile = PIDLockFile(opts.pidfile, threaded=False)
+        dctx.pidfile = TimeoutPIDLockFile(opts.pidfile, threaded=False)
         print "pidfile =", dctx.pidfile
     if opts.user:
         from pwd import getpwnam

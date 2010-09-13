@@ -6,6 +6,7 @@ import signal
 import gevent
 from gevent import core
 from gevent.wsgi import WSGIServer
+from gevent.baseserver import _tcp_listener
 
 from gevent_spawn import signal_stop
 from gevent_spawn.worker import Worker
@@ -21,7 +22,7 @@ class Master(object):
 
     def __init__(self, address, wsgi_app):
         # Convenient way of creating a socket. \o/
-        self.sock = WSGIServer(address, wsgi_app).make_listener(address)
+        self.sock = _tcp_listener(address, reuse_addr=1)
         self.address = address
         self.application = wsgi_app
         self.num_workers = 0
@@ -56,11 +57,10 @@ class Master(object):
         core.signal(signal.SIGHUP, self._cb_sighup)
         core.signal(signal.SIGTERM, self._cb_sigterm)
 
-    def start_worker(self, sock=None):
-        """Start a worker on *sock* or *self.sock* and add to list."""
+    def start_worker(self):
+        """Start a worker and add to list."""
         if self.stop_event.is_set():
             return
-        sock = sock if sock else self.sock
         pipe_r, pipe_w = os.pipe()
         pid = gevent.fork()
         if pid:
